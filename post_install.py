@@ -3,9 +3,11 @@
 
 Runs on container creation to set up:
 - Onboarding bypass (when CLAUDE_CODE_OAUTH_TOKEN is set)
-- Claude settings (bypassPermissions mode)
+- Claude settings (bypassPermissions + deny absolute-path package managers)
+- Token-strip /etc/profile.d drop-in (reduces /proc env exposure)
 - Tmux configuration (200k history, mouse support)
 - Directory ownership fixes for mounted volumes
+- Global gitignore + local git config
 """
 
 import contextlib
@@ -95,27 +97,74 @@ def setup_onboarding_bypass():
 
 
 def setup_claude_settings():
-    """Configure Claude Code with bypassPermissions enabled."""
+    """Configure Claude Code with bypassPermissions and deny absolute-path
+    invocations of package managers so they cannot bypass the sbe PATH shims."""
     claude_dir = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude"))
     claude_dir.mkdir(parents=True, exist_ok=True)
 
     settings_file = claude_dir / "settings.json"
 
-    # Load existing settings or start fresh
+    # Load existing settings or start fresh. Tolerate unreadable / malformed
+    # state: settings.json may be present from the image layer with permissions
+    # that fix_directory_ownership couldn't resolve (rare but seen on
+    # OrbStack/Colima named volumes).
     settings = {}
     if settings_file.exists():
-        with contextlib.suppress(json.JSONDecodeError):
+        try:
             settings = json.loads(settings_file.read_text())
+        except (json.JSONDecodeError, OSError) as e:
+            print(
+                f"[post_install] Warning: cannot read {settings_file} ({e}), "
+                "regenerating from scratch",
+                file=sys.stderr,
+            )
 
     # Set bypassPermissions mode
     if "permissions" not in settings:
         settings["permissions"] = {}
     settings["permissions"]["defaultMode"] = "bypassPermissions"
 
-    settings_file.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
-    print(
-        f"[post_install] Claude settings configured: {settings_file}", file=sys.stderr
-    )
+    # Sbe shims at /usr/local/bin/sbe-shims/ are first on PATH, but /usr/bin/npm
+    # and ~/.fnm/<version>/bin/npm bypass them. Deny those explicitly.
+    deny = settings["permissions"].setdefault("deny", [])
+    desired_denies = [
+        "Bash(/usr/bin/npm:*)",
+        "Bash(/usr/bin/pnpm:*)",
+        "Bash(/usr/bin/yarn:*)",
+        "Bash(/usr/bin/bun:*)",
+        "Bash(/usr/bin/npx:*)",
+        "Bash(/usr/bin/cargo:*)",
+        "Bash(/usr/bin/rustc:*)",
+        "Bash(/usr/bin/pip:*)",
+        "Bash(/usr/bin/pip3:*)",
+        "Bash(/usr/bin/uv:*)",
+        "Bash(/usr/bin/poetry:*)",
+        "Bash(/usr/bin/mvn:*)",
+        "Bash(/usr/bin/gradle:*)",
+        "Bash(/usr/bin/sbt:*)",
+        "Bash(/usr/bin/mix:*)",
+        "Bash(/home/vscode/.fnm/**)",
+        "Bash(/home/vscode/.local/state/fnm_multishells/**)",
+    ]
+    for d in desired_denies:
+        if d not in deny:
+            deny.append(d)
+
+    try:
+        settings_file.write_text(
+            json.dumps(settings, indent=2) + "\n", encoding="utf-8"
+        )
+        print(
+            f"[post_install] Claude settings configured: {settings_file}",
+            file=sys.stderr,
+        )
+    except OSError as e:
+        print(
+            f"[post_install] Warning: could not write {settings_file} ({e}). "
+            "Claude defaults will apply; bypassPermissions + sbe denies are not "
+            "in effect for this container. Check sudo / no-new-privileges.",
+            file=sys.stderr,
+        )
 
 
 def setup_tmux_config():
@@ -166,7 +215,14 @@ set -g status-right '%Y-%m-%d %H:%M'
 
 
 def fix_directory_ownership():
-    """Fix ownership of mounted volumes that may have root ownership."""
+    """Normalize ownership AND mode of named-volume mount points.
+
+    Fresh docker named volumes get initialized from the image's content, which
+    preserves the build-time UID/mode. With updateRemoteUserUID and on
+    OrbStack/Colima, files inside the volume can end up unreadable by the
+    runtime vscode user even when the mount point itself looks fine — so we
+    chown -R unconditionally (idempotent) and chmod -R u+rwX to ensure the
+    owner has read+write everywhere."""
     uid = os.getuid()
     gid = os.getgid()
 
@@ -177,24 +233,31 @@ def fix_directory_ownership():
     ]
 
     for dir_path in dirs_to_fix:
-        if dir_path.exists():
-            try:
-                # Use sudo to fix ownership if needed
-                stat_info = dir_path.stat()
-                if stat_info.st_uid != uid:
-                    subprocess.run(
-                        ["sudo", "chown", "-R", f"{uid}:{gid}", str(dir_path)],
-                        check=True,
-                        capture_output=True,
-                    )
-                    print(
-                        f"[post_install] Fixed ownership: {dir_path}", file=sys.stderr
-                    )
-            except (PermissionError, subprocess.CalledProcessError) as e:
-                print(
-                    f"[post_install] Warning: Could not fix ownership of {dir_path}: {e}",
-                    file=sys.stderr,
-                )
+        if not dir_path.exists():
+            continue
+        try:
+            subprocess.run(
+                ["sudo", "chown", "-R", f"{uid}:{gid}", str(dir_path)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                ["sudo", "chmod", "-R", "u+rwX", str(dir_path)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            print(
+                f"[post_install] Normalized ownership/perms: {dir_path}",
+                file=sys.stderr,
+            )
+        except subprocess.CalledProcessError as e:
+            print(
+                f"[post_install] Warning: could not normalize {dir_path}: "
+                f"exit {e.returncode}; stderr={e.stderr.strip() if e.stderr else ''}",
+                file=sys.stderr,
+            )
 
 
 def setup_global_gitignore():
@@ -297,14 +360,50 @@ node_modules/
     )
 
 
+def setup_token_strip_profile():
+    """Drop /etc/profile.d/99-unset-claude-tokens.sh so new login shells start
+    without CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_API_KEY in env. Reduces the
+    /proc/<pid>/environ exposure for child processes that build scripts spawn.
+
+    Does NOT close the gap for long-lived processes that were started with the
+    tokens in env (Claude itself, the VS Code server). See README's
+    Build-time Sandboxing section for the documented limitation."""
+    profile = "/etc/profile.d/99-unset-claude-tokens.sh"
+    body = (
+        "# Unset Claude tokens in new login shells (set by post_install.py).\n"
+        "unset CLAUDE_CODE_OAUTH_TOKEN\n"
+        "unset ANTHROPIC_API_KEY\n"
+    )
+    try:
+        subprocess.run(
+            ["sudo", "tee", profile],
+            input=body,
+            text=True,
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(["sudo", "chmod", "0644", profile], check=True)
+        print(f"[post_install] Token-strip profile: {profile}", file=sys.stderr)
+    except subprocess.CalledProcessError as e:
+        print(
+            f"[post_install] Warning: could not install token-strip profile: {e}",
+            file=sys.stderr,
+        )
+
+
 def main():
     """Run all post-install configuration."""
     print("[post_install] Starting post-install configuration...", file=sys.stderr)
 
+    # Must run first: fresh named volumes (~/.claude, /commandhistory, gh) come up
+    # owned by the image's build-time UID 1000, but `updateRemoteUserUID: true`
+    # remaps vscode to the host UID at container start. Without chowning here,
+    # subsequent setup steps hit PermissionError reading/writing those paths.
+    fix_directory_ownership()
     setup_onboarding_bypass()
     setup_claude_settings()
+    setup_token_strip_profile()
     setup_tmux_config()
-    fix_directory_ownership()
     setup_global_gitignore()
 
     print("[post_install] Configuration complete!", file=sys.stderr)

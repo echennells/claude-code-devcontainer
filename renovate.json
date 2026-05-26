@@ -17,9 +17,21 @@
       "description": "Update ARG versions in Dockerfile from GitHub releases",
       "managerFilePatterns": ["/(^|/)Dockerfile$/"],
       "matchStrings": [
-        "# renovate: datasource=(?<datasource>[a-z-]+?) depName=(?<depName>.+?)\\n(?:ENV|ARG) .+?_VERSION=(?<currentValue>.+?)\\n"
+        "# renovate: datasource=(?<datasource>[a-z-]+?) depName=(?<depName>(?!tyrchen/sbe).+?)\\n(?:ENV|ARG) .+?_VERSION=(?<currentValue>.+?)\\n"
       ],
       "extractVersionTemplate": "^v?(?<version>.+)$"
+    },
+    {
+      "customType": "regex",
+      "description": "Update SBE_VERSION (tag prefix sbexec-v)",
+      "fileMatch": ["(^|/)Dockerfile$"],
+      "matchStrings": [
+        "# renovate: datasource=github-releases depName=tyrchen/sbe\\nARG SBE_VERSION=(?<currentValue>sbexec-v[^\\n]+)\\n"
+      ],
+      "datasourceTemplate": "github-releases",
+      "depNameTemplate": "tyrchen/sbe",
+      "extractVersionTemplate": "^sbexec-v(?<version>.+)$",
+      "versioningTemplate": "semver"
     }
   ]
 }

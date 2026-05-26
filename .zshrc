@@ -9,6 +9,20 @@ export FNM_DIR="$HOME/.fnm"
 export PATH="$FNM_DIR:$PATH"
 eval "$(fnm env --use-on-cd)"
 
+# Pin sbe-shims to the front of PATH so package-manager invocations route
+# through the sandbox. fnm prepends its multishell dir to PATH at shell start
+# and on `cd` into projects with .nvmrc, which would otherwise shadow our
+# shims for npm/pnpm/yarn/bun/npx. Strip any existing occurrences first to
+# avoid duplicates accumulating across `cd`s.
+_sbe_pin_shims() {
+  local p="${PATH//\/usr\/local\/bin\/sbe-shims:/}"
+  p="${p%:/usr/local/bin/sbe-shims}"
+  export PATH="/usr/local/bin/sbe-shims:$p"
+}
+_sbe_pin_shims
+autoload -U add-zsh-hook
+add-zsh-hook chpwd _sbe_pin_shims
+
 # History settings
 export HISTFILE=/commandhistory/.zsh_history
 export HISTSIZE=200000

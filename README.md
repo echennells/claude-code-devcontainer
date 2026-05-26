@@ -237,6 +237,62 @@ sudo iptables -A OUTPUT -j DROP
   rules with `ip6tables` and an `ipset ... family inet6`
 - Rules are lost on container restart; re-apply them per session
 
+## Build-time Sandboxing (sbe)
+
+Install-time exfil and stage-2 download attacks are the most common supply-chain vectors (ua-parser-js, coa, rc, rustdecimal, shai-hulud, xz-utils all exploit install/build-time code execution). For ecosystems where `--ignore-scripts` is not an option — Rust `build.rs`, Python `setup.py`, JVM lifecycle plugins, Ruby `extconf.rb`, Elixir `mix compile` hooks — the build step *requires* arbitrary code execution. Containment is the only defense.
+
+This devcontainer ships [`tyrchen/sbe`](https://github.com/tyrchen/sbe), a per-command Linux sandbox using Landlock LSM + seccomp-bpf + a CONNECT-only HTTPS proxy. Package managers (`npm`, `pnpm`, `yarn`, `bun`, `npx`, `cargo`, `rustc`, `pip`, `pip3`, `uv`, `poetry`, `mvn`, `gradle`, `sbt`, `mix`) are wrapped via PATH shims at `/usr/local/bin/sbe-shims/` and run with a kernel-enforced cage that:
+
+- denies reads of `~/.gitconfig`, `~/.claude`, `~/.config/gh`, `.git/config`;
+- pins TCP egress to the sbe proxy, which filters by hostname against per-ecosystem allowlists (registry.npmjs.org, crates.io, pypi.org, etc.);
+- blocks UDP egress (via iptables rules applied at every container start) except DNS to Docker's embedded resolver, closing DNS-as-exfil channels;
+- strips `CLAUDE_CODE_OAUTH_TOKEN` and `ANTHROPIC_API_KEY` from the wrapped process's environment.
+
+### Audit visibility
+
+When sbe's proxy blocks an outbound connection, it prints a line like
+
+```
+WARN blocked connection to non-allowed domain host=evil.example.com port=443
+```
+
+directly to the wrapped tool's stderr. No flags or setup needed — the line will appear inline with `npm install` / `cargo build` output whenever a build tries to reach a non-allowlisted host. This is the working audit channel.
+
+**Landlock-blocked file reads/writes/execs are silent by design** — the kernel's Landlock LSM does not currently emit audit events. File-access denials surface only as `EACCES` exit codes from the wrapped tool.
+
+sbe's `--audit` and `--audit-log` flags have known issues in v0.3.2 (`--audit` spawns a kmsg reader thread that hangs at teardown; `--audit-log` produces an empty file on Linux). The shims do not pass them. The proxy WARN line above is sufficient for diagnosing blocked egresses.
+
+The cage fires regardless of visibility; this is a transparency gap, not an enforcement gap.
+
+### What this does NOT protect
+
+- **Runtime code execution.** `npm test`, `pytest`, `cargo test`, dev servers, language servers, and any `import` of a compromised dep at runtime are *outside* the sbe perimeter and run with full devc privilege. The shims only cover install/build time.
+- **JVM hostname allowlist.** Maven/Gradle/sbt do not honor `HTTPS_PROXY`. sbe still enforces the file/exec sandbox and pins TCP egress to port 443, but per-host filtering is not in effect for JVM builds.
+- **The `/proc/<pid>/environ` channel.** Claude itself and the VS Code server are started with the OAuth token in their environment via `remoteEnv`. The `/etc/profile.d/99-unset-claude-tokens.sh` drop-in unsets the token in *new* shells but does not retroactively scrub it from long-lived processes. A sandboxed build script cannot read the file but could read `/proc/<claude-pid>/environ` (same uid). Closing this requires moving the token off the env entirely (planned for a follow-up).
+- **`bash` `/dev/tcp/host/port`.** If `bash` is in a profile's allowExec, its kernel-direct TCP path bypasses the sbe proxy.
+- **DNS rebinding / TLS SNI domain-fronting** at the sbe proxy.
+- **Supply-chain integrity.** A backdoored binary produced by a clean build is out of scope for sbe (different layer — SLSA / sigstore / reproducible builds).
+
+### Extending allowlists for legitimate builds
+
+If a build legitimately needs to reach a host not in sbe's default profile, extend it in a project-local `.sbe.yaml` at your repo root (sbe walks to git root):
+
+```yaml
+profiles:
+  rust:
+    extends: rust
+    allowDomains:
+      - my-internal-registry.example.com
+```
+
+The five sbe ecosystems are `node`, `rust`, `python`, `elixir`, `java`. The shims auto-pick the right profile per tool.
+
+For a one-shot escape hatch in an interactive shell, drop the shim dir from PATH for that session:
+
+```bash
+PATH=$(echo "$PATH" | sed 's|/usr/local/bin/sbe-shims:||') cargo build
+```
+
 ## Threat Model
 
 **Protects against:**

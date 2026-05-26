@@ -78,7 +78,8 @@ ENV PATH="/home/vscode/.local/bin:$PATH"
 RUN curl -fsSL https://claude.ai/install.sh | bash && \
   claude plugin marketplace add anthropics/skills && \
   claude plugin marketplace add trailofbits/skills && \
-  claude plugin marketplace add trailofbits/skills-curated
+  claude plugin marketplace add trailofbits/skills-curated && \
+  chmod -R u=rwX,go=rX /home/vscode/.claude
 
 # Install Python 3.13 via uv (fast binary download, not source compilation)
 RUN uv python install 3.13 --default
@@ -110,6 +111,148 @@ COPY --chown=vscode:vscode .zshrc /home/vscode/.zshrc.custom
 
 # Append custom zshrc to the main one
 RUN echo 'source ~/.zshrc.custom' >> /home/vscode/.zshrc
+
+# Install sbe (per-command Linux sandbox: Landlock LSM + seccomp + CONNECT-only proxy).
+# SHA256 values from the GitHub release; bump manually when SBE_VERSION changes.
+# renovate: datasource=github-releases depName=tyrchen/sbe
+ARG SBE_VERSION=sbexec-v0.3.2
+USER root
+RUN ARCH=$(dpkg --print-architecture) && \
+  case "${ARCH}" in \
+    amd64) T=x86_64-unknown-linux-musl;  SHA=315cc352f3c663b2555e33a00ad850e7cafca6fefdfdad2d35726ad268bf4caf ;; \
+    arm64) T=aarch64-unknown-linux-musl; SHA=345122b20f2cc8a05f65cc404afd909f85789a73fba93c3784c8b5c753dac99b ;; \
+    *) echo "unsupported arch ${ARCH}" && exit 1 ;; \
+  esac && \
+  curl -fsSL -o /tmp/sbe.tgz \
+    "https://github.com/tyrchen/sbe/releases/download/${SBE_VERSION}/sbe-${SBE_VERSION}-${T}.tar.gz" && \
+  echo "${SHA}  /tmp/sbe.tgz" | sha256sum -c - && \
+  tar -xzf /tmp/sbe.tgz -C /usr/local/bin sbe && \
+  chmod 0755 /usr/local/bin/sbe && \
+  rm /tmp/sbe.tgz
+
+# Sbe PATH shims: single _sbe-shim script + symlinks per package manager.
+# Resolves the real binary by stripping the shim dir from PATH then `command -v`,
+# so fnm multishell paths (where node/npm live under ~/.fnm/, not /usr/bin/) work.
+RUN <<'SHIM_SETUP'
+mkdir -p /usr/local/bin/sbe-shims
+cat > /usr/local/bin/sbe-shims/_sbe-shim <<'SHIM'
+#!/bin/sh
+set -eu
+tool=$(basename "$0")
+cleaned=
+IFS=:
+for p in $PATH; do
+  case "$p" in
+    /usr/local/bin/sbe-shims|/usr/local/bin/sbe-shims/) ;;
+    *) cleaned="${cleaned:+$cleaned:}$p" ;;
+  esac
+done
+unset IFS
+real=$(PATH="$cleaned" command -v "$tool" 2>/dev/null || true)
+if [ -z "$real" ] || [ "$real" = "/usr/local/bin/sbe-shims/$tool" ]; then
+  echo "sbe-shim: cannot find real $tool on PATH" >&2
+  exit 127
+fi
+# Map tool -> sbe ecosystem profile. sbe v0.3.2 supports: node, rust, python,
+# elixir, java. Explicit --profile avoids auto-detect failures.
+case "$tool" in
+  npm|pnpm|yarn|bun|npx)         prof=node ;;
+  cargo|rustc)                   prof=rust ;;
+  pip|pip3|uv|poetry)            prof=python ;;
+  mvn|gradle|sbt)                prof=java ;;
+  mix)                           prof=elixir ;;
+  *)                             prof= ;;
+esac
+profile_arg=
+[ -n "$prof" ] && profile_arg="--profile $prof"
+# Do NOT pass --audit by default — sbe v0.3.2's --audit hangs at teardown
+# (kmsg reader thread doesn't exit when child does), and the kmsg/syslog
+# infrastructure to make it work was deliberately removed. Network denials
+# surface as the proxy's WARN line on stderr without any flags. See
+# SBE_DEVC_NOTES.md §13.7 for the full rationale.
+exec env -u CLAUDE_CODE_OAUTH_TOKEN -u ANTHROPIC_API_KEY \
+  sbe run $profile_arg -- "$real" "$@"
+SHIM
+chmod 0755 /usr/local/bin/sbe-shims/_sbe-shim
+for t in npm pnpm yarn bun npx cargo rustc pip pip3 uv poetry mvn gradle sbt mix; do
+  ln -sf _sbe-shim /usr/local/bin/sbe-shims/$t
+done
+SHIM_SETUP
+
+# Egress filter — run by postStartCommand as root via sudo. iptables rules don't
+# survive docker stop/start, so postStartCommand re-applies each container start.
+RUN <<'EGRESS_SETUP'
+cat > /opt/sbe-egress.sh <<'EGRESS'
+#!/bin/sh
+set -eu
+iptables -F OUTPUT
+DNS=$(awk '/^nameserver / {print $2}' /etc/resolv.conf | tr '\n' ' ')
+for s in $DNS; do
+  iptables -A OUTPUT -p udp -d "$s" --dport 53 -j ACCEPT
+  iptables -A OUTPUT -p tcp -d "$s" --dport 53 -j ACCEPT
+done
+iptables -A OUTPUT -o lo -j ACCEPT
+iptables -A OUTPUT -p tcp -j ACCEPT
+iptables -A OUTPUT -p icmp -j ACCEPT
+iptables -A OUTPUT -j DROP
+EGRESS
+chmod 0755 /opt/sbe-egress.sh
+EGRESS_SETUP
+
+USER vscode
+
+# Global sbe config: extend built-in profiles to denyRead credential paths.
+RUN <<'SBE_CONFIG'
+mkdir -p /home/vscode/.config/sbe
+cat > /home/vscode/.config/sbe/config.yaml <<'YAML'
+version: 1
+profiles:
+  node:
+    extends: node
+    denyRead:
+      - ~/.gitconfig
+      - ~/.config/git
+      - ~/.claude
+      - ~/.config/gh
+      - /workspace/.git/config
+  rust:
+    extends: rust
+    denyRead:
+      - ~/.gitconfig
+      - ~/.config/git
+      - ~/.claude
+      - ~/.config/gh
+      - /workspace/.git/config
+  python:
+    extends: python
+    denyRead:
+      - ~/.gitconfig
+      - ~/.config/git
+      - ~/.claude
+      - ~/.config/gh
+      - /workspace/.git/config
+      - ~/.pypirc
+  java:
+    extends: java
+    denyRead:
+      - ~/.gitconfig
+      - ~/.config/git
+      - ~/.claude
+      - ~/.config/gh
+      - ~/.m2/settings.xml
+      - ~/.gradle/gradle.properties
+  elixir:
+    extends: elixir
+    denyRead:
+      - ~/.gitconfig
+      - ~/.config/git
+      - ~/.claude
+      - ~/.config/gh
+YAML
+SBE_CONFIG
+
+# Shims win PATH lookup so package-manager invocations are sandboxed by default.
+ENV PATH="/usr/local/bin/sbe-shims:$PATH"
 
 # Copy post_install script
 COPY --chown=vscode:vscode post_install.py /opt/post_install.py

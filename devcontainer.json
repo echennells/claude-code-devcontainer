@@ -12,7 +12,8 @@
   },
   "runArgs": [
     "--cap-add=NET_ADMIN",
-    "--cap-add=NET_RAW"
+    "--cap-add=NET_RAW",
+    "--security-opt=no-new-privileges:false"
   ],
   "init": true,
   "updateRemoteUserUID": true,
@@ -70,5 +71,6 @@
   "initializeCommand": "test -f \"$HOME/.gitconfig\" || touch \"$HOME/.gitconfig\"",
   "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=delegated",
   "workspaceFolder": "/workspace",
-  "postCreateCommand": "uv run --no-project /opt/post_install.py"
+  "postCreateCommand": "python3 /opt/post_install.py",
+  "postStartCommand": "sudo /opt/sbe-egress.sh"
 }
