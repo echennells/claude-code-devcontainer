@@ -505,13 +505,11 @@ egress except to a local DNS resolver, to close the DNS-exfil gap.
   shim, blocking `/proc` cross-process reads, blocking UDP egress, and
   tightening default `denyRead`. Without these, two specific channels
   (`/proc/<pid>/environ`, DNS-over-UDP) remain open.
-- sbe is a **supply-chain-protection tool by design** — it wraps the
-  install/build phase. The program's later execution (tests, dev
-  servers, language servers, the running app) is purely additive on
-  top of the upstream devc and runs with normal devcontainer privileges,
-  identical to behavior before sbe was added. A malicious dep that
-  defers its payload to runtime (`import` time) is not blocked; that's
-  out of scope for sbe, not a failure of this integration.
+- Commands invoked outside the shim list (`node app.js`, `python3
+  script.py`, bare `pytest`) run with normal devcontainer privileges,
+  the same as on the upstream devc without sbe. A malicious dep that
+  fires its payload when your code later imports it, rather than when
+  the package manager installs it, isn't blocked by this integration.
 
 ---
 
@@ -690,12 +688,10 @@ Known gaps remaining after phase 1:
   the OAuth token in env. Phase 2 work: move token to a credential
   file at a path sbe denies.
 - ⚠️ Landlock file/exec denials are silent (kernel limitation, not ours).
-- ⚠️ Runtime code (tests, dev servers, language servers, the app
-  itself) runs with normal devcontainer privileges, same as on the
-  upstream devc without sbe. sbe is a supply-chain-protection tool by
-  design; it wraps the install/build commands, not the program's later
-  execution. A malicious dep that defers its payload to the first
-  `import` at runtime is not blocked.
+- ⚠️ Commands not invoked through a shimmed package manager
+  (`node app.js`, `python3 script.py`, bare `pytest`) run with normal
+  devcontainer privileges. A malicious dep that fires its payload at
+  import time rather than during install isn't blocked.
 - ⚠️ JVM hostname allowlist (java profile's `enableProxy: false`
   exception) — by sbe design.
 - ⚠️ TLS SNI domain fronting at sbe proxy — by sbe design.

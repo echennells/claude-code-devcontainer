@@ -237,45 +237,36 @@ sudo iptables -A OUTPUT -j DROP
   rules with `ip6tables` and an `ipset ... family inet6`
 - Rules are lost on container restart; re-apply them per session
 
-## Build-time Sandboxing (sbe)
+## Package-manager sandboxing (sbe)
 
-Install-time exfil and stage-2 download attacks are the most common supply-chain vectors (ua-parser-js, coa, rc, rustdecimal, shai-hulud, xz-utils all exploit install/build-time code execution). For ecosystems where `--ignore-scripts` is not an option — Rust `build.rs`, Python `setup.py`, JVM lifecycle plugins, Ruby `extconf.rb`, Elixir `mix compile` hooks — the build step *requires* arbitrary code execution. Containment is the only defense.
+The shims at `/usr/local/bin/sbe-shims/` route `npm`, `pnpm`, `yarn`, `bun`, `npx`, `cargo`, `rustc`, `pip`, `pip3`, `uv`, `poetry`, `mvn`, `gradle`, `sbt`, and `mix` through [`tyrchen/sbe`](https://github.com/tyrchen/sbe). When you run one of these, sbe applies a Landlock LSM + seccomp-bpf cage and routes outbound TLS through a CONNECT-only hostname-filtering proxy. The cage covers the command and any process it spawns.
 
-This devcontainer ships [`tyrchen/sbe`](https://github.com/tyrchen/sbe), a per-command Linux sandbox using Landlock LSM + seccomp-bpf + a CONNECT-only HTTPS proxy. Package managers (`npm`, `pnpm`, `yarn`, `bun`, `npx`, `cargo`, `rustc`, `pip`, `pip3`, `uv`, `poetry`, `mvn`, `gradle`, `sbt`, `mix`) are wrapped via PATH shims at `/usr/local/bin/sbe-shims/` and run with a kernel-enforced cage that:
+The default profiles allow ecosystem registries (`registry.npmjs.org`, `crates.io`, `pypi.org`, etc.) and the local project tree, and deny reads of credential paths like `~/.gitconfig`, `~/.claude`, and `~/.config/gh`. Outbound to non-allowlisted hosts is rejected by the proxy and logged to stderr.
 
-- denies reads of `~/.gitconfig`, `~/.claude`, `~/.config/gh`, `.git/config`;
-- pins TCP egress to the sbe proxy, which filters by hostname against per-ecosystem allowlists (registry.npmjs.org, crates.io, pypi.org, etc.);
-- blocks UDP egress (via iptables rules applied at every container start) except DNS to Docker's embedded resolver, closing DNS-as-exfil channels;
-- strips `CLAUDE_CODE_OAUTH_TOKEN` and `ANTHROPIC_API_KEY` from the wrapped process's environment.
+Two related defenses are applied at container start independent of sbe but in the same threat model:
+
+- `iptables` drops UDP egress except DNS to Docker's embedded resolver.
+- `CLAUDE_CODE_OAUTH_TOKEN` and `ANTHROPIC_API_KEY` are stripped from wrapped processes' environments, and unset in new login shells via `/etc/profile.d/99-unset-claude-tokens.sh`.
+
+Commands invoked outside the shimmed list — `node app.js`, `python3 script.py`, anything Claude runs that isn't a wrapped package manager — aren't affected. They run with the same privileges as on the upstream devc.
+
+### What this doesn't cover
+
+- Maven, Gradle, and sbt don't honor `HTTPS_PROXY`. For JVM builds, sbe still enforces the file/exec sandbox and pins TCP egress to port 443, but per-host filtering is not in effect.
+- The `/proc/<pid>/environ` channel. Claude itself was started with the OAuth token in its environment via `remoteEnv`; a sandboxed process running as the same uid can read `/proc/<claude-pid>/environ`. The token strip only affects new login shells, not the long-lived Claude process.
+- `bash` `/dev/tcp/host/port` if `bash` is in the profile's `allowExec`. The kernel handles that directly, bypassing the proxy.
+- DNS rebinding and TLS SNI domain fronting at the proxy.
+- Supply-chain integrity at the binary level — a backdoored binary produced by a clean build is a different concern (SLSA, sigstore, reproducible builds).
 
 ### Audit visibility
 
-When sbe's proxy blocks an outbound connection, it prints a line like
+When the proxy blocks an outbound connection, it prints `WARN blocked connection to non-allowed domain host=...` on the wrapped tool's stderr. No setup required.
 
-```
-WARN blocked connection to non-allowed domain host=evil.example.com port=443
-```
+Landlock denies on file reads, writes, and execs don't emit kernel events — Landlock LSM has no audit output in current Linux kernels. Those denials surface as `EACCES` exit codes from the wrapped tool. sbe's `--audit` and `--audit-log` flags are not used by the shims; both have upstream issues in v0.3.2.
 
-directly to the wrapped tool's stderr. No flags or setup needed — the line will appear inline with `npm install` / `cargo build` output whenever a build tries to reach a non-allowlisted host. This is the working audit channel.
+### Extending allowlists
 
-**Landlock-blocked file reads/writes/execs are silent by design** — the kernel's Landlock LSM does not currently emit audit events. File-access denials surface only as `EACCES` exit codes from the wrapped tool.
-
-sbe's `--audit` and `--audit-log` flags have known issues in v0.3.2 (`--audit` spawns a kmsg reader thread that hangs at teardown; `--audit-log` produces an empty file on Linux). The shims do not pass them. The proxy WARN line above is sufficient for diagnosing blocked egresses.
-
-The cage fires regardless of visibility; this is a transparency gap, not an enforcement gap.
-
-### What this does NOT protect
-
-- **The cage only fires during install/build commands** (`npm install`, `cargo build`, `pip install`, etc.). Once a dep is installed, anything that later imports or runs that code — your dev server, test runners, your application — runs with normal devcontainer privileges, the same as on the upstream devc without sbe. sbe is purely additive on the install/build phase; runtime behavior is unchanged. If a malicious dep waits to fire its payload until the first time your code imports it, sbe doesn't help — you're back to standard container isolation only.
-- **JVM hostname allowlist.** Maven/Gradle/sbt do not honor `HTTPS_PROXY`. sbe still enforces the file/exec sandbox and pins TCP egress to port 443, but per-host filtering is not in effect for JVM builds.
-- **The `/proc/<pid>/environ` channel.** Claude itself and the VS Code server are started with the OAuth token in their environment via `remoteEnv`. The `/etc/profile.d/99-unset-claude-tokens.sh` drop-in unsets the token in *new* shells but does not retroactively scrub it from long-lived processes. A sandboxed build script cannot read the file but could read `/proc/<claude-pid>/environ` (same uid). Closing this requires moving the token off the env entirely (planned for a follow-up).
-- **`bash` `/dev/tcp/host/port`.** If `bash` is in a profile's allowExec, its kernel-direct TCP path bypasses the sbe proxy.
-- **DNS rebinding / TLS SNI domain-fronting** at the sbe proxy.
-- **Supply-chain integrity.** A backdoored binary produced by a clean build is out of scope for sbe (different layer — SLSA / sigstore / reproducible builds).
-
-### Extending allowlists for legitimate builds
-
-If a build legitimately needs to reach a host not in sbe's default profile, extend it in a project-local `.sbe.yaml` at your repo root (sbe walks to git root):
+If a build needs to reach a host not in the default allowlist, extend it in a project-local `.sbe.yaml` at the git root:
 
 ```yaml
 profiles:
@@ -287,9 +278,9 @@ profiles:
 
 The five sbe ecosystems are `node`, `rust`, `python`, `elixir`, `java`. The shims auto-pick the right profile per tool.
 
-For a one-shot escape hatch in an interactive shell, drop the shim dir from PATH for that session:
+For a one-shot bypass in an interactive shell, drop the shim dir from PATH:
 
-```bash
+```sh
 PATH=$(echo "$PATH" | sed 's|/usr/local/bin/sbe-shims:||') cargo build
 ```
 
