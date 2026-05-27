@@ -12,8 +12,7 @@
   },
   "runArgs": [
     "--cap-add=NET_ADMIN",
-    "--cap-add=NET_RAW",
-    "--security-opt=no-new-privileges:false"
+    "--cap-add=NET_RAW"
   ],
   "init": true,
   "updateRemoteUserUID": true,
