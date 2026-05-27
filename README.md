@@ -266,7 +266,7 @@ The cage fires regardless of visibility; this is a transparency gap, not an enfo
 
 ### What this does NOT protect
 
-- **Runtime code execution.** `npm test`, `pytest`, `cargo test`, dev servers, language servers, and any `import` of a compromised dep at runtime are *outside* the sbe perimeter and run with full devc privilege. The shims only cover install/build time.
+- **The cage only fires during install/build commands** (`npm install`, `cargo build`, `pip install`, etc.). Once a dep is installed, anything that later imports or runs that code — your dev server, test runners, your application — runs with normal devcontainer privileges, the same as on the upstream devc without sbe. sbe is purely additive on the install/build phase; runtime behavior is unchanged. If a malicious dep waits to fire its payload until the first time your code imports it, sbe doesn't help — you're back to standard container isolation only.
 - **JVM hostname allowlist.** Maven/Gradle/sbt do not honor `HTTPS_PROXY`. sbe still enforces the file/exec sandbox and pins TCP egress to port 443, but per-host filtering is not in effect for JVM builds.
 - **The `/proc/<pid>/environ` channel.** Claude itself and the VS Code server are started with the OAuth token in their environment via `remoteEnv`. The `/etc/profile.d/99-unset-claude-tokens.sh` drop-in unsets the token in *new* shells but does not retroactively scrub it from long-lived processes. A sandboxed build script cannot read the file but could read `/proc/<claude-pid>/environ` (same uid). Closing this requires moving the token off the env entirely (planned for a follow-up).
 - **`bash` `/dev/tcp/host/port`.** If `bash` is in a profile's allowExec, its kernel-direct TCP path bypasses the sbe proxy.
