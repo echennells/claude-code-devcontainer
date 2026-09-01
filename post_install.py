@@ -3,7 +3,7 @@
 
 Runs on container creation to set up:
 - Onboarding bypass (when CLAUDE_CODE_OAUTH_TOKEN is set)
-- Claude settings (bypassPermissions mode)
+- Claude settings (bypassPermissions mode + deny absolute-path package managers)
 - Tmux configuration (200k history, mouse support)
 - Directory ownership fixes for mounted volumes
 """
@@ -111,6 +111,32 @@ def setup_claude_settings():
     if "permissions" not in settings:
         settings["permissions"] = {}
     settings["permissions"]["defaultMode"] = "bypassPermissions"
+
+    # Safe Chain shims are first on PATH, but an absolute path reaches the real
+    # binary and skips screening entirely. Under bypassPermissions nothing else
+    # would stop that, so deny the known bypass routes explicitly.
+    #
+    # ~/.fnm and ~/.local/state/fnm_multishells are where fnm keeps the real
+    # node toolchain; /usr/bin and /usr/local/bin cover system-installed copies.
+    # System python is denied too, since `python3 -m pip install ...` is a pip
+    # invocation wearing a different hat. Bare names are untouched and remain the
+    # supported way to call any of these.
+    home = Path.home()
+    managers = [
+        "npm", "npx", "yarn", "pnpm", "pnpx", "bun", "bunx", "rush", "rushx",
+        "pip", "pip3", "uv", "uvx", "poetry", "pipx", "pdm",
+        "python", "python3",
+    ]
+    deny = settings["permissions"].setdefault("deny", [])
+    bypass_paths = [f"Bash(/usr/bin/{m}:*)" for m in managers]
+    bypass_paths += [f"Bash(/usr/local/bin/{m}:*)" for m in managers]
+    bypass_paths += [
+        f"Bash({home}/.fnm/**)",
+        f"Bash({home}/.local/state/fnm_multishells/**)",
+    ]
+    for d in bypass_paths:
+        if d not in deny:
+            deny.append(d)
 
     settings_file.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
     print(

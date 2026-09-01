@@ -111,5 +111,28 @@ COPY --chown=vscode:vscode .zshrc /home/vscode/.zshrc.custom
 # Append custom zshrc to the main one
 RUN echo 'source ~/.zshrc.custom' >> /home/vscode/.zshrc
 
+# Install Aikido Safe Chain: screens npm/PyPI installs against Aikido Intel by
+# routing registry downloads through a local proxy, blocking known-malicious
+# packages (including transitive ones) before they land.
+#
+# --ci installs PATH shims (~/.safe-chain/shims) instead of shell aliases. The
+# alias flavour only fires in interactive shells, and Claude Code runs its
+# commands non-interactively, so aliases would leave the container's main
+# consumer of npm unprotected.
+#
+# The installer verifies the checksum of the binary it downloads; the SHA256
+# below covers the installer script itself and is tied to this exact version
+# (the script hardcodes the version it installs), so bump both together.
+# renovate: datasource=github-releases depName=AikidoSec/safe-chain
+ARG SAFE_CHAIN_VERSION=1.5.15
+ARG SAFE_CHAIN_INSTALLER_SHA256=de0565e3d6346407a604e84e639e95fea8758748063da2216bbfdca5feda5dd2
+RUN curl -fsSL "https://github.com/AikidoSec/safe-chain/releases/download/${SAFE_CHAIN_VERSION}/install-safe-chain.sh" -o /tmp/install-safe-chain.sh && \
+  echo "${SAFE_CHAIN_INSTALLER_SHA256}  /tmp/install-safe-chain.sh" | sha256sum -c - && \
+  sh /tmp/install-safe-chain.sh --ci && \
+  rm /tmp/install-safe-chain.sh
+
+# Shims win PATH lookup so package-manager invocations are screened by default.
+ENV PATH="/home/vscode/.safe-chain/shims:/home/vscode/.safe-chain/bin:$PATH"
+
 # Copy post_install script
 COPY --chown=vscode:vscode post_install.py /opt/post_install.py

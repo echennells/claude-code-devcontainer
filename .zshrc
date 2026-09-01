@@ -9,6 +9,22 @@ export FNM_DIR="$HOME/.fnm"
 export PATH="$FNM_DIR:$PATH"
 eval "$(fnm env --use-on-cd)"
 
+# Pin safe-chain shims to the front of PATH so package-manager invocations are
+# screened. fnm prepends its multishell dir to PATH at shell start and again on
+# `cd` into a project with .nvmrc, which would otherwise shadow the shims for
+# npm/npx/yarn/pnpm/bun (pip et al. are unaffected, since fnm only injects node
+# tooling -- which makes the bypass easy to miss). Strip existing occurrences
+# first so repeated `cd`s don't accumulate duplicates.
+_safe_chain_pin_shims() {
+  local d="$HOME/.safe-chain/shims"
+  local p="${PATH//$d:/}"
+  p="${p%:$d}"
+  export PATH="$d:$p"
+}
+_safe_chain_pin_shims
+autoload -U add-zsh-hook
+add-zsh-hook chpwd _safe_chain_pin_shims
+
 # History settings
 export HISTFILE=/commandhistory/.zsh_history
 export HISTSIZE=200000
