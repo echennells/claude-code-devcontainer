@@ -758,3 +758,51 @@ iptables UDP drop in `postStartCommand` and the kernel port pin still stand.
 - Token stripping through the shim — `process.env.CLAUDE_CODE_OAUTH_TOKEN`
   is undefined. 0.4 also clears ambient environment by default, so the shim's
   `env -u` is now defence in depth rather than the primary control.
+
+### 14.1 Test results against 0.4.1 (2026-09-02)
+
+Run on arm64, OrbStack kernel 7.0.14.
+
+Holding:
+
+- All 15 shims resolve ahead of fnm, and survive `cd` into an `.nvmrc` project.
+- Reads denied inside the sandbox: `~/.ssh`, `~/.aws`, `~/.netrc`,
+  `~/.docker/config.json`, `~/.config/gh`, `~/.claude`, `~/.gitconfig`,
+  `/workspace/.env`.
+- Writes denied to `~/.claude`, `~/.ssh`, `/etc`, `/usr/local/bin`;
+  `/workspace/node_modules` still writable.
+- `sudo` and `su` refused by the launcher.
+- The cage survives three levels of nested `sh` and `node`'s `child_process`.
+- OAuth token absent inside the shim perimeter.
+
+**`/proc` cross-process snooping is fixed in 0.4.** With a victim process
+holding `CLAUDE_CODE_OAUTH_TOKEN`, an unsandboxed reader gets the token from
+`/proc/<pid>/environ`; the same read inside the sandbox returns
+`Permission denied`. This retires the §7 finding that made the "cannot reach
+your Claude token" claim false, and the §4 `/proc` gap along with it.
+
+Still open, and confirmed by test rather than assumed:
+
+- **Domain egress is not enforced on Linux.** Raw TCP from inside the sandbox
+  reached `example.com:443`, `pypi.org:443` and `1.1.1.1:443`. Only tools that
+  honour `HTTPS_PROXY` are filtered; raw sockets are not. `bash`'s
+  `/dev/tcp/example.com/443` also opened. `--strict` cannot run here at all.
+- **DNS exfil survives the iptables rule.** UDP to a non-resolver address is
+  dropped, but a query for an attacker-controlled subdomain sent through the
+  permitted resolver is answered. The rule constrains which server may be
+  addressed, not what may be asked of it.
+- **Runtime execution remains outside the perimeter**, demonstrated directly:
+  a dependency reading `~/.claude/.credentials.json` gets `EACCES` under
+  `sbe run`, and `READ-OK` when required by a plain `node` process.
+
+Two integration bugs found and fixed while testing:
+
+- The deny list covered `/usr/bin` but not `/usr/local/bin`, where `uv`
+  actually lives. `/usr/local/bin/uv pip install` ran completely unsandboxed.
+- `~/.local/bin` and `~/.local/share/uv/python` were undenied, and uv's
+  interpreter there carries its own pip (26.0.1).
+
+Only `npm`, `npx` and `uv` have real binaries behind their shims in this
+image; the other twelve are inert until those tools are installed. An inert
+shim exits 127 with a clear message rather than falling through, so it fails
+closed.

@@ -124,27 +124,30 @@ def setup_claude_settings():
         settings["permissions"] = {}
     settings["permissions"]["defaultMode"] = "bypassPermissions"
 
-    # Sbe shims at /usr/local/bin/sbe-shims/ are first on PATH, but /usr/bin/npm
-    # and ~/.fnm/<version>/bin/npm bypass them. Deny those explicitly.
+    # Sbe shims at /usr/local/bin/sbe-shims/ are first on PATH, but an absolute
+    # path to the real binary reaches it unsandboxed. Deny the known locations.
+    #
+    # /usr/local/bin matters as much as /usr/bin here: uv ships at
+    # /usr/local/bin/uv, so covering only /usr/bin left a live bypass.
+    # ~/.local/bin holds uv's python/python3 symlinks and that interpreter
+    # carries its own pip, and ~/.local/share/uv/python is the referent.
+    # Bare names are untouched and remain the supported way to call these.
+    home = Path.home()
+    managers = [
+        "npm", "pnpm", "yarn", "bun", "npx",
+        "cargo", "rustc",
+        "pip", "pip3", "uv", "uvx", "poetry",
+        "mvn", "gradle", "sbt", "mix",
+        "python", "python3",
+    ]
     deny = settings["permissions"].setdefault("deny", [])
-    desired_denies = [
-        "Bash(/usr/bin/npm:*)",
-        "Bash(/usr/bin/pnpm:*)",
-        "Bash(/usr/bin/yarn:*)",
-        "Bash(/usr/bin/bun:*)",
-        "Bash(/usr/bin/npx:*)",
-        "Bash(/usr/bin/cargo:*)",
-        "Bash(/usr/bin/rustc:*)",
-        "Bash(/usr/bin/pip:*)",
-        "Bash(/usr/bin/pip3:*)",
-        "Bash(/usr/bin/uv:*)",
-        "Bash(/usr/bin/poetry:*)",
-        "Bash(/usr/bin/mvn:*)",
-        "Bash(/usr/bin/gradle:*)",
-        "Bash(/usr/bin/sbt:*)",
-        "Bash(/usr/bin/mix:*)",
-        "Bash(/home/vscode/.fnm/**)",
-        "Bash(/home/vscode/.local/state/fnm_multishells/**)",
+    desired_denies = [f"Bash(/usr/bin/{m}:*)" for m in managers]
+    desired_denies += [f"Bash(/usr/local/bin/{m}:*)" for m in managers]
+    desired_denies += [
+        f"Bash({home}/.fnm/**)",
+        f"Bash({home}/.local/state/fnm_multishells/**)",
+        f"Bash({home}/.local/bin/**)",
+        f"Bash({home}/.local/share/uv/python/**)",
     ]
     for d in desired_denies:
         if d not in deny:
