@@ -134,5 +134,43 @@ RUN curl -fsSL "https://github.com/AikidoSec/safe-chain/releases/download/${SAFE
 # Shims win PATH lookup so package-manager invocations are screened by default.
 ENV PATH="/home/vscode/.safe-chain/shims:/home/vscode/.safe-chain/bin:$PATH"
 
+# Startup health check. The generated shims fail OPEN: if the safe-chain binary
+# is not reachable they print a warning to stderr and run the real package
+# manager unscreened. Claude Code runs non-interactively under
+# bypassPermissions, so nobody reads that warning and the container would keep
+# installing unscreened packages while looking healthy. Verify the chain at
+# every container start instead, and fail loudly so the breakage is visible
+# before any package is installed.
+RUN <<'HEALTHCHECK_SETUP'
+cat > /opt/safe-chain-healthcheck.sh <<'CHECK'
+#!/bin/sh
+set -eu
+fail() {
+  echo "======================================================================" >&2
+  echo "SAFE CHAIN HEALTH CHECK FAILED: $1" >&2
+  echo "Package installs would run WITHOUT malware screening." >&2
+  echo "Rebuild the container; do not install dependencies until this passes." >&2
+  echo "======================================================================" >&2
+  exit 1
+}
+
+command -v safe-chain >/dev/null 2>&1 || fail "safe-chain not found on PATH"
+safe-chain --version >/dev/null 2>&1 || fail "safe-chain found but will not execute"
+[ -d "$HOME/.safe-chain/shims" ] || fail "shim directory missing"
+[ -x "$HOME/.safe-chain/shims/npm" ] || fail "npm shim missing or not executable"
+
+# Confirm PATH ordering in a login shell: .zshrc re-pins the shim dir on every
+# cd because fnm prepends its multishell dir and would otherwise shadow it.
+resolved=$(zsh -lic 'command -v npm' 2>/dev/null | tr -d '\r')
+case "$resolved" in
+  "$HOME/.safe-chain/shims/"*) ;;
+  *) fail "npm resolves to '$resolved', not the safe-chain shim" ;;
+esac
+
+echo "[safe-chain] health check passed: $(safe-chain --version 2>/dev/null)"
+CHECK
+chmod 0755 /opt/safe-chain-healthcheck.sh
+HEALTHCHECK_SETUP
+
 # Copy post_install script
 COPY --chown=vscode:vscode post_install.py /opt/post_install.py
