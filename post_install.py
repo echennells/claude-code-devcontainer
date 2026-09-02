@@ -133,6 +133,11 @@ def setup_claude_settings():
     bypass_paths += [
         f"Bash({home}/.fnm/**)",
         f"Bash({home}/.local/state/fnm_multishells/**)",
+        # uv keeps its managed CPython here and symlinks python/python3 into
+        # ~/.local/bin. That interpreter ships a working pip, so an absolute
+        # path to either location reaches PyPI without safe-chain screening.
+        f"Bash({home}/.local/bin/**)",
+        f"Bash({home}/.local/share/uv/python/**)",
     ]
     for d in bypass_paths:
         if d not in deny:
