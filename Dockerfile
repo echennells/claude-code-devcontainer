@@ -114,12 +114,12 @@ RUN echo 'source ~/.zshrc.custom' >> /home/vscode/.zshrc
 # Install sbe (per-command Linux sandbox: Landlock LSM + seccomp + CONNECT-only proxy).
 # SHA256 values from the GitHub release; bump manually when SBE_VERSION changes.
 # renovate: datasource=github-releases depName=tyrchen/sbe
-ARG SBE_VERSION=sbexec-v0.3.2
+ARG SBE_VERSION=sbexec-v0.4.1
 USER root
 RUN ARCH=$(dpkg --print-architecture) && \
   case "${ARCH}" in \
-    amd64) T=x86_64-unknown-linux-musl;  SHA=315cc352f3c663b2555e33a00ad850e7cafca6fefdfdad2d35726ad268bf4caf ;; \
-    arm64) T=aarch64-unknown-linux-musl; SHA=345122b20f2cc8a05f65cc404afd909f85789a73fba93c3784c8b5c753dac99b ;; \
+    amd64) T=x86_64-unknown-linux-musl;  SHA=726a1a6a32534e7213a6246469a3a3b6c77fe01fccb32856088a0bfc22aae18d ;; \
+    arm64) T=aarch64-unknown-linux-musl; SHA=11ac7fd3bb383041eb40acca7f4b72b6eb399c40d717727b4b94f0b974d38d7b ;; \
     *) echo "unsupported arch ${ARCH}" && exit 1 ;; \
   esac && \
   curl -fsSL -o /tmp/sbe.tgz \
@@ -164,11 +164,15 @@ case "$tool" in
 esac
 profile_arg=
 [ -n "$prof" ] && profile_arg="--profile $prof"
-# Do NOT pass --audit by default — sbe v0.3.2's --audit hangs at teardown
-# (kmsg reader thread doesn't exit when child does), and the kmsg/syslog
-# infrastructure to make it work was deliberately removed. Network denials
-# surface as the proxy's WARN line on stderr without any flags. See
-# SBE_DEVC_NOTES.md §13.7 for the full rationale.
+# Do NOT pass --audit by default. 0.4 reports correlated process-tree audit
+# streaming as unavailable on both backends and --audit now fails outright
+# rather than hanging as it did in 0.3.2. Denials still surface as EACCES from
+# the wrapped tool. See SBE_DEVC_NOTES.md §13.7.
+#
+# Standard mode is deliberate: --strict refuses to start on Linux because
+# Landlock authorizes destination ports, not addresses, so domain egress
+# cannot be enforced. Standard mode keeps filesystem, environment, descriptor,
+# privilege and proxy protections and says so on stderr each run.
 exec env -u CLAUDE_CODE_OAUTH_TOKEN -u ANTHROPIC_API_KEY \
   sbe run $profile_arg -- "$real" "$@"
 SHIM
@@ -201,13 +205,18 @@ EGRESS_SETUP
 USER vscode
 
 # Global sbe config: extend built-in profiles to denyRead credential paths.
+# In sbe 0.4 a profile keyed by an ecosystem name merges onto that built-in;
+# `extends` is only for chaining custom bases and self-referencing it is
+# rejected as a cycle. Verify a merge with `sbe inspect`, not `sbe profiles`
+# (the latter prints built-in defaults only).
+# 0.4's built-ins already deny ~/.config/gh, ~/.pypirc and /workspace/.env*;
+# ~/.claude (the Claude OAuth token and session state) is not covered by them,
+# which is the main reason this file still exists.
 RUN <<'SBE_CONFIG'
 mkdir -p /home/vscode/.config/sbe
 cat > /home/vscode/.config/sbe/config.yaml <<'YAML'
-version: 1
 profiles:
   node:
-    extends: node
     denyRead:
       - ~/.gitconfig
       - ~/.config/git
@@ -215,7 +224,6 @@ profiles:
       - ~/.config/gh
       - /workspace/.git/config
   rust:
-    extends: rust
     denyRead:
       - ~/.gitconfig
       - ~/.config/git
@@ -223,7 +231,6 @@ profiles:
       - ~/.config/gh
       - /workspace/.git/config
   python:
-    extends: python
     denyRead:
       - ~/.gitconfig
       - ~/.config/git
@@ -232,7 +239,6 @@ profiles:
       - /workspace/.git/config
       - ~/.pypirc
   java:
-    extends: java
     denyRead:
       - ~/.gitconfig
       - ~/.config/git
@@ -241,7 +247,6 @@ profiles:
       - ~/.m2/settings.xml
       - ~/.gradle/gradle.properties
   elixir:
-    extends: elixir
     denyRead:
       - ~/.gitconfig
       - ~/.config/git

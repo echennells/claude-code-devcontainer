@@ -695,3 +695,66 @@ Known gaps remaining after phase 1:
 - ⚠️ JVM hostname allowlist (java profile's `enableProxy: false`
   exception) — by sbe design.
 - ⚠️ TLS SNI domain fronting at sbe proxy — by sbe design.
+
+---
+
+## 14. Upgrade to sbe 0.4.1 (2026-09-02)
+
+Pin moved from `sbexec-v0.3.2` (2026-05-12) to `sbexec-v0.4.1` (2026-08-29),
+spanning a breaking security release and the usability patch that followed it
+four days later.
+
+### What forced code changes
+
+1. **`version: 1` is rejected.** The 0.4 config schema refuses unknown
+   top-level fields; the key is simply dropped.
+2. **`extends: <same-name>` is a cycle.** A profile keyed by an ecosystem name
+   already merges onto that built-in. `extends` exists for chaining custom
+   bases, and self-referencing it now fails the profile lint.
+3. **Verify merges with `sbe inspect`, not `sbe profiles`.** The latter prints
+   built-in defaults and will not show config-supplied entries, which makes a
+   working merge look broken.
+
+### What the built-ins now cover
+
+0.4's `node` profile denies `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.azure`,
+`~/.config/gcloud`, `~/.kube/config`, `~/.docker/config.json`, `~/.netrc`,
+`~/.password-store`, cargo credentials, `~/.pypirc`, `~/.config/gh`, browser
+profiles, and `/workspace/.env{,.local,.production}`.
+
+`~/.claude` is **not** among them, which is why the global config in the
+Dockerfile still exists. `~/.gitconfig`, `~/.config/git` and
+`/workspace/.git/config` are likewise still ours to deny.
+
+The `/workspace/.env*` denial is worth noting against §7: the 0.4.1 release
+notes say standard mode treats the workspace as readable untrusted input
+"including `.env*`", but the shipped profile denies those paths and the denial
+was confirmed to hold. Built-in secret denials win over the workspace grant.
+
+### Strict mode is unavailable on Linux
+
+`sbe run --strict` refuses to start:
+
+> sandbox backend cannot enforce 'strict-domain-egress' on this kernel: Linux
+> Landlock authorizes destination ports, not destination addresses. A malicious
+> child can bypass the CONNECT proxy.
+
+This is upstream conceding §3's criticism directly. Standard mode is therefore
+the only workable configuration here, and it prints a warning on every
+invocation stating that domain egress is not enforced while filesystem,
+environment, descriptor, privilege and proxy protections remain active. The
+warning is honest and is deliberately not suppressed.
+
+Consequently the §6 row "Stage-2 download from attacker domain at build time —
+covered (proxy 403)" is now **best-effort on Linux**, not covered. The
+iptables UDP drop in `postStartCommand` and the kernel port pin still stand.
+
+### Verified on 0.4.1 (arm64, kernel 7.0.14)
+
+- `npm install` through the shim succeeds and packages land.
+- `~/.claude/.credentials.json` — Permission denied.
+- `~/.config/gh/hosts.yml` — Permission denied.
+- `/workspace/.env` — Permission denied.
+- Token stripping through the shim — `process.env.CLAUDE_CODE_OAUTH_TOKEN`
+  is undefined. 0.4 also clears ambient environment by default, so the shim's
+  `env -u` is now defence in depth rather than the primary control.

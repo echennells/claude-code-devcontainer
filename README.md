@@ -262,7 +262,7 @@ Commands invoked outside the shimmed list — `node app.js`, `python3 script.py`
 
 When the proxy blocks an outbound connection, it prints `WARN blocked connection to non-allowed domain host=...` on the wrapped tool's stderr. No setup required.
 
-Landlock denies on file reads, writes, and execs don't emit kernel events — Landlock LSM has no audit output in current Linux kernels. Those denials surface as `EACCES` exit codes from the wrapped tool. sbe's `--audit` and `--audit-log` flags are not used by the shims; both have upstream issues in v0.3.2.
+Landlock denies on file reads, writes, and execs don't emit kernel events — Landlock LSM has no audit output in current Linux kernels. Those denials surface as `EACCES` exit codes from the wrapped tool. sbe's `--audit` and `--audit-log` flags are not used by the shims: 0.4 reports correlated process-tree auditing as unavailable on both backends, so both flags fail rather than returning partial data.
 
 ### Extending allowlists
 
