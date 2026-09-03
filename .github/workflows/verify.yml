@@ -1,0 +1,109 @@
+name: verify
+
+# The stack this repo builds fails silently: Safe Chain prints nothing on a
+# clean package, sbe's warning is on every invocation and becomes wallpaper,
+# and a broken PATH chain still gives you a working npm. So the only useful
+# check is one that asserts EFFECTS on a real built image, on every push.
+#
+# Every regression hit while developing these branches would have been caught
+# here: a config schema break, a cyclic-extends lint failure, an unreadable CA
+# bundle taking out every Python install, and an absolute-path bypass.
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  schedule:
+    # Weekly. The vendored pins are checked by Renovate, but the *fixtures* are
+    # not ours -- Aikido's known-bad test package and the registries can change
+    # under a green build. A scheduled run turns that into a signal.
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  static:
+    name: static checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Shell syntax
+        run: |
+          bash -n test/verify-supply-chain.sh
+          # .zshrc holds the PATH hook that orders the whole stack; a syntax
+          # error there silently drops the hook and the order flips.
+          if command -v zsh >/dev/null 2>&1; then zsh -n .zshrc; else
+            echo "::warning::zsh unavailable; .zshrc not syntax-checked"; fi
+
+      - name: JSON validity
+        run: |
+          python3 -c "import json;json.load(open('devcontainer.json'))"
+          python3 -c "import json;json.load(open('renovate.json'))"
+
+      - name: Python syntax
+        run: python3 -m py_compile post_install.py
+
+      - name: Every pinned download has a checksum
+        # A pin without a checksum is not a pin. Fail closed if a version ARG
+        # ever lands without its SHA256 next to it.
+        run: |
+          fail=0
+          for arg in SBE_VERSION SAFE_CHAIN_VERSION SCH_COMMIT; do
+            if grep -q "ARG ${arg}=" Dockerfile; then
+              case "$arg" in
+                SBE_VERSION)        need='sha256sum -c' ;;
+                SAFE_CHAIN_VERSION) need='SAFE_CHAIN_INSTALLER_SHA256' ;;
+                SCH_COMMIT)         need='SCH_HARDEN_SHA256' ;;
+              esac
+              if grep -q "$need" Dockerfile; then
+                echo "ok: $arg is checksum-verified"
+              else
+                echo "::error::$arg is pinned but has no checksum ($need missing)"; fail=1
+              fi
+            fi
+          done
+          exit $fail
+
+  verify:
+    name: build and verify effects
+    needs: static
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Runner kernel and Landlock support
+        # Printed so a skipped containment section is explainable rather than
+        # mysterious. sbe needs Landlock >= 5.13, and >= 6.7 for per-port TCP.
+        run: |
+          uname -r
+          grep -i landlock /boot/config-"$(uname -r)" 2>/dev/null || \
+            echo "(kernel config not readable; the suite probes at runtime)"
+
+      - name: Build image
+        # Also the only place the amd64 artifacts are exercised: development
+        # happens on arm64, so the x86_64 sbe tarball checksum and the
+        # safe-chain amd64 installer path are first proven here.
+        run: docker build -t devc:ci .
+
+      - name: Verify effects
+        run: |
+          docker run --rm \
+            --cap-add=NET_ADMIN --cap-add=NET_RAW \
+            -v "$PWD:/repo:ro" \
+            devc:ci bash /repo/test/verify-supply-chain.sh
+
+      - name: Startup health check
+        # Same script postStartCommand runs, exercised independently of the
+        # suite so a broken health check cannot hide behind a passing suite.
+        run: |
+          docker run --rm --cap-add=NET_ADMIN --cap-add=NET_RAW \
+            devc:ci /opt/supply-chain-healthcheck.sh
