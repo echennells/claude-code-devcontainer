@@ -52,16 +52,7 @@
     "NODE_OPTIONS": "--max-old-space-size=4096",
     "CLAUDE_CONFIG_DIR": "/home/vscode/.claude",
     "POWERLEVEL9K_DISABLE_GITSTATUS": "true",
-    "GIT_CONFIG_GLOBAL": "/home/vscode/.gitconfig.local",
-    "UV_LINK_MODE": "copy",
-    "NPM_CONFIG_IGNORE_SCRIPTS": "true",
-    "NPM_CONFIG_AUDIT": "true",
-    "NPM_CONFIG_FUND": "false",
-    "NPM_CONFIG_SAVE_EXACT": "true",
-    "NPM_CONFIG_UPDATE_NOTIFIER": "false",
-    "NPM_CONFIG_MIN_RELEASE_AGE": "1",
-    "PYTHONDONTWRITEBYTECODE": "1",
-    "PIP_DISABLE_PIP_VERSION_CHECK": "1"
+    "GIT_CONFIG_GLOBAL": "/home/vscode/.gitconfig.local"
   },
   "remoteEnv": {
     "CLAUDE_CODE_OAUTH_TOKEN": "${localEnv:CLAUDE_CODE_OAUTH_TOKEN:}",
@@ -71,5 +62,5 @@
   "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=delegated",
   "workspaceFolder": "/workspace",
   "postCreateCommand": "python3 /opt/post_install.py",
-  "postStartCommand": "sudo /opt/sbe-egress.sh"
+  "postStartCommand": "sudo /opt/sbe-egress.sh && /opt/supply-chain-healthcheck.sh"
 }

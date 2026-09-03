@@ -283,6 +283,71 @@ For a one-shot bypass in an interactive shell, drop the shim dir from PATH:
 ```sh
 PATH=$(echo "$PATH" | sed 's|/usr/local/bin/sbe-shims:||') cargo build
 ```
+## Supply-Chain Screening (Safe Chain)
+
+[Aikido Safe Chain](https://github.com/AikidoSec/safe-chain) ships in the image and
+screens package installs against [Aikido Intel](https://intel.aikido.dev/?tab=malware).
+It runs a local proxy that registry downloads are routed through and blocks packages
+known to be malicious, including transitive dependencies, before they reach disk.
+
+Setup installs 18 shims: `npm`, `npx`, `yarn`, `pnpm`, `pnpx`, `bun`, `bunx`, `rush`,
+`rushx`, `pip`, `pip3`, `uv`, `uvx`, `poetry`, `pipx`, `pdm`, and also `python` and
+`python3` so that `python -m pip install ...` is caught as well. Invocations that are
+not installs — `python3 -c ...`, `uv run ...`, `--version` — pass straight through, so
+shimming `python` does not disturb `postCreateCommand`.
+
+Interception is via PATH shims at `~/.safe-chain/shims`, not shell aliases. Aliases
+only fire in interactive shells, and Claude runs its commands non-interactively, so
+shims are what make the screening apply to agent-driven installs as well as your own.
+Invoke package managers bare (`npm install`); an absolute path such as `/usr/bin/npm`
+bypasses the shim.
+
+fnm needs care here. It prepends its multishell directory to PATH at shell start and
+again on every `cd` into a project with `.nvmrc`, which puts the real `npm`/`npx`
+ahead of the shims. `.zshrc` therefore re-pins the shim directory to the front of PATH
+and installs a `chpwd` hook to redo it after each `cd`. Without that, interactive
+`npm` silently skips screening while `pip` still hits its shim, since fnm only injects
+node tooling -- a partial bypass that looks fine unless you check node specifically.
+
+### What this means for Claude specifically
+
+Claude Code does not simply inherit the container environment: before running commands
+it builds a snapshot of your shell, and that snapshot starts with `unalias -a`. The
+shell-alias flavour of Safe Chain would therefore be stripped before Claude's first
+command ever ran. The snapshot *does* carry `export PATH` as produced by sourcing
+`.zshrc`, which is why the shim pinning above is the thing that actually keeps Claude
+screened rather than a convenience for the human at the prompt.
+
+Shims only bind bare names, though, and Claude runs in `bypassPermissions` mode. An
+absolute path would reach the real binary and skip screening, so `post_install.py`
+writes deny rules into `~/.claude/settings.json` covering `/usr/bin` and
+`/usr/local/bin` copies of every shimmed manager, plus the fnm directories
+(`~/.fnm`, `~/.local/state/fnm_multishells`) where the real node toolchain lives.
+Bare names are untouched and stay the supported way to invoke any of them.
+
+This is defence against Claude installing something malicious by accident. It is not
+containment of a Claude that is actively trying to get around it: sudo is passwordless
+in this container, so the deny list is a guardrail, not a boundary.
+
+Check that it is wired up, and that blocking works (`safe-chain-test` is a harmless
+canary package published for this purpose):
+
+```bash
+npm safe-chain-verify
+npm install safe-chain-test
+```
+
+Screening needs egress to Aikido Intel. Under [network isolation](#network-isolation)
+its endpoints have to be in the allowlist alongside the registries themselves.
+
+The proxy terminates TLS in order to inspect registry traffic, so setup generates a
+local CA under `~/.safe-chain/certs/`. The private key lives in the container and is
+exactly as trustworthy as the container is.
+
+This is screening, not sandboxing: it catches packages Aikido already knows about and
+does nothing about a package that is merely new. `NPM_CONFIG_IGNORE_SCRIPTS=true` and
+`NPM_CONFIG_MIN_RELEASE_AGE` are set in `devcontainer.json` to blunt the two most
+common gaps.
 
 ## Threat Model
 
@@ -291,6 +356,7 @@ PATH=$(echo "$PATH" | sed 's|/usr/local/bin/sbe-shims:||') cargo build
 - Direct access to your SSH key material and other credentials
 - Unrestricted, direct access to the whole filesystem
 - Cross-engagement leakage
+- Installing npm/PyPI packages Aikido Intel already flags as malicious
 
 **Does not protect against:**
 
@@ -309,6 +375,7 @@ PATH=$(echo "$PATH" | sed 's|/usr/local/bin/sbe-shims:||') cargo build
 | Base | Ubuntu 24.04, Node.js 24, Python 3.13 + uv, zsh |
 | User | `vscode` (passwordless sudo), working dir `/workspace` |
 | Tools | `rg`, `fd`, `tmux`, `fzf`, `delta`, `iptables`, `ipset` |
+| Supply chain | Aikido Safe Chain screens `npm`/PyPI installs via PATH shims |
 | Volumes (survive rebuilds) | Command history (`/commandhistory`), Claude config (`~/.claude`), GitHub CLI auth (`~/.config/gh`) |
 | Host mounts | `~/.gitconfig`, `.devcontainer/`, `.git/config`, `.git/hooks/` (all read-only) |
 | Auto-configured | `bypassPermissions` mode (via `post_install.py`), skills from [anthropics/skills](https://github.com/anthropics/skills) + [trailofbits/skills](https://github.com/trailofbits/skills) + [trailofbits/skills-curated](https://github.com/trailofbits/skills-curated), git-delta |

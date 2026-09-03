@@ -173,8 +173,39 @@ profile_arg=
 # Landlock authorizes destination ports, not addresses, so domain egress
 # cannot be enforced. Standard mode keeps filesystem, environment, descriptor,
 # privilege and proxy protections and says so on stderr each run.
+# Admit Safe Chain's CA bundle into the cage.
+#
+# Safe Chain sits outside the cage and MITMs the download to screen it, then
+# overwrites SSL_CERT_FILE / REQUESTS_CA_BUNDLE / NODE_EXTRA_CA_CERTS to point
+# at a bundle it writes under /tmp -- it says so on stderr and does it whatever
+# we set at build time. The caged child cannot read that path, so TLS fails
+# with UnknownIssuer and every uv install breaks.
+#
+# Grant read on exactly the paths those variables name, nothing wider. The
+# bundle already exists by the time this shim runs, because Safe Chain is the
+# outer layer. sbe's built-in secret denials still win over --allow-read, so
+# this cannot be used to smuggle a credential path in.
+#
+# NOTE ON WHAT THIS DOES AND DOES NOT BUY. It keeps TLS working; it does not
+# restore Safe Chain's proxy screening inside the cage. sbe reserves
+# HTTPS_PROXY for its own authenticated proxy and refuses --keep-env for it
+# ("environment variable 'HTTPS_PROXY' is reserved by sbe"), so a caged child
+# always talks to sbe's proxy, never Safe Chain's. Consequence, measured:
+#   npm    -- screened. Safe Chain's pre-install scan runs OUTSIDE the cage,
+#             so a known-bad package is refused before sbe is ever invoked.
+#   python -- NOT screened. Safe Chain screens pip/uv only by MITM through its
+#             proxy, and that proxy is unreachable from inside the cage.
+#             Python keeps the sbe cage and the age gate, not the intel feed.
+# Closing this needs upstream support for chaining sbe's proxy to an outer one.
+ca_args=""
+for v in "${SSL_CERT_FILE:-}" "${REQUESTS_CA_BUNDLE:-}" "${NODE_EXTRA_CA_CERTS:-}"; do
+  [ -n "$v" ] && [ -f "$v" ] || continue
+  case " $ca_args " in *" $v "*) continue ;; esac
+  ca_args="$ca_args --allow-read $v"
+done
+
 exec env -u CLAUDE_CODE_OAUTH_TOKEN -u ANTHROPIC_API_KEY \
-  sbe run $profile_arg -- "$real" "$@"
+  sbe run $profile_arg $ca_args -- "$real" "$@"
 SHIM
 chmod 0755 /usr/local/bin/sbe-shims/_sbe-shim
 for t in npm pnpm yarn bun npx cargo rustc pip pip3 uv poetry mvn gradle sbt mix; do
@@ -255,8 +286,218 @@ profiles:
 YAML
 SBE_CONFIG
 
-# Shims win PATH lookup so package-manager invocations are sandboxed by default.
-ENV PATH="/usr/local/bin/sbe-shims:$PATH"
+# Install Aikido Safe Chain: screens npm/PyPI installs against Aikido Intel by
+# routing registry downloads through a local proxy, blocking known-malicious
+# packages (including transitive ones) before they land.
+#
+# --ci installs PATH shims (~/.safe-chain/shims) instead of shell aliases. The
+# alias flavour only fires in interactive shells, and Claude Code runs its
+# commands non-interactively, so aliases would leave the container's main
+# consumer of npm unprotected.
+#
+# The installer verifies the checksum of the binary it downloads; the SHA256
+# below covers the installer script itself and is tied to this exact version
+# (the script hardcodes the version it installs), so bump both together.
+# renovate: datasource=github-releases depName=AikidoSec/safe-chain
+ARG SAFE_CHAIN_VERSION=1.5.15
+ARG SAFE_CHAIN_INSTALLER_SHA256=de0565e3d6346407a604e84e639e95fea8758748063da2216bbfdca5feda5dd2
+RUN curl -fsSL "https://github.com/AikidoSec/safe-chain/releases/download/${SAFE_CHAIN_VERSION}/install-safe-chain.sh" -o /tmp/install-safe-chain.sh && \
+  echo "${SAFE_CHAIN_INSTALLER_SHA256}  /tmp/install-safe-chain.sh" | sha256sum -c - && \
+  sh /tmp/install-safe-chain.sh --ci && \
+  rm /tmp/install-safe-chain.sh
+
+# Safe Chain's CA into the system trust store.
+#
+# Safe Chain screens Python by MITM-ing the download through a local proxy, so
+# the client must trust its CA. It drops a bundle in /tmp and points the child
+# at it -- but the child runs inside the sbe cage, which gives sandboxed
+# processes a private temp root, so that path is unreadable and the handshake
+# fails with "invalid peer certificate: UnknownIssuer". Every uv install breaks.
+#
+# /etc/ssl/certs IS readable inside the cage, so install the CA there instead
+# and point the TLS clients at the system bundle.
+#
+# The tradeoff is explicit: a MITM CA in the system store means whoever holds
+# ~/.safe-chain/certs/ca-key.pem can mint a trusted cert for any host in this
+# container. That is the trust Safe Chain already asks for by design -- this
+# only makes it durable and readable from inside the sandbox. The key stays
+# denied to sandboxed children, which is what keeps a caged install from
+# minting its own.
+USER root
+RUN cp /home/vscode/.safe-chain/certs/ca-cert.pem \
+       /usr/local/share/ca-certificates/safe-chain.crt && \
+    update-ca-certificates >/dev/null 2>&1 && \
+    echo "[build] safe-chain CA installed into system trust store"
+USER vscode
+
+# Point TLS clients at the system bundle rather than Safe Chain's /tmp copy.
+# UV_NATIVE_TLS makes uv use the OS trust store instead of its vendored roots.
+ENV UV_NATIVE_TLS=1 \
+    SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
+    REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt \
+    NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt
+
+# Baseline shim order for EVERY process, login shell or not. The .zshrc hook
+# only repairs what fnm disturbs in interactive zsh; this is what makes the
+# chain hold for `bash -c` and `sh -c`, which is how Claude Code and opencode
+# actually invoke commands.
+# Order: Safe Chain (screen) -> sbe (cage) -> real binary.
+ENV PATH="/home/vscode/.safe-chain/shims:/usr/local/bin/sbe-shims:/home/vscode/.safe-chain/bin:$PATH"
+
+# Startup health check.
+#
+# Presence checks are not enough here, and that is the whole lesson of this
+# stack: a merged image once passed "both shims are on PATH" while Safe Chain's
+# proxy layer was dead (its CA bundle lives in /tmp, which the sbe cage denies)
+# and every Python install was broken. So this asserts EFFECTS -- a known-bad
+# fixture is actually refused, and a sandboxed child is actually denied -- not
+# that files exist.
+#
+# It matters because every failure in this stack is silent. Safe Chain prints
+# nothing on a clean package, so "screening ran and found nothing" and
+# "screening never ran" look identical. Claude Code runs non-interactively
+# under bypassPermissions, so there is no human to notice either.
+RUN <<'HEALTHCHECK_SETUP'
+cat > /opt/supply-chain-healthcheck.sh <<'CHECK'
+#!/bin/sh
+set -eu
+FAILED=0
+fail() { echo "  FAIL: $1" >&2; FAILED=1; }
+ok()   { echo "  ok:   $1"; }
+
+echo "[supply-chain] verifying the chain is actually enforcing..."
+
+# --- layer presence (cheap, and locates a break) ---
+command -v safe-chain >/dev/null 2>&1 || fail "safe-chain not on PATH"
+command -v sbe        >/dev/null 2>&1 || fail "sbe not on PATH"
+
+# --- PATH order: Safe Chain outermost, sbe next ---
+npm_path=$(command -v npm 2>/dev/null || echo none)
+case "$npm_path" in
+  "$HOME/.safe-chain/shims/"*) ok "npm -> Safe Chain shim" ;;
+  *) fail "npm resolves to '$npm_path', not the Safe Chain shim" ;;
+esac
+inner=$(PATH=$(echo "$PATH" | sed "s|$HOME/.safe-chain/shims:||") command -v npm 2>/dev/null || echo none)
+case "$inner" in
+  /usr/local/bin/sbe-shims/*) ok "next hop -> sbe shim" ;;
+  *) fail "second hop is '$inner', not the sbe shim (cage layer skipped)" ;;
+esac
+
+# --- EFFECT 1: the cage actually denies a credential read ---
+if sbe run --profile node -- cat "$HOME/.claude/.credentials.json" 2>&1 |
+     grep -q "Permission denied"; then
+  ok "sbe denies ~/.claude to a sandboxed child"
+else
+  # An absent file is not proof of a working cage; make one and retry.
+  mkdir -p "$HOME/.claude" && echo probe > "$HOME/.claude/.credentials.json"
+  if sbe run --profile node -- cat "$HOME/.claude/.credentials.json" 2>&1 |
+       grep -q "Permission denied"; then
+    ok "sbe denies ~/.claude to a sandboxed child"
+  else
+    fail "sandboxed child could read ~/.claude -- cage not enforcing"
+  fi
+fi
+
+# --- EFFECT 2: npm package-manager config is age-gated ---
+age=$(npm config get min-release-age 2>/dev/null | tr -d '\r')
+case "$age" in
+  ""|null|undefined|0) fail "npm min-release-age is '$age' -- age gate off" ;;
+  *) ok "npm min-release-age=$age" ;;
+esac
+
+# --- EFFECT 3 (opt-in): a known-bad fixture is actually refused ---
+# Costs a network round trip, so it is off by default. Set
+# SUPPLY_CHAIN_DEEP_CHECK=1 to exercise the real screening path.
+if [ "${SUPPLY_CHAIN_DEEP_CHECK:-0}" = "1" ]; then
+  d=$(mktemp -d)
+  ( cd "$d" && echo '{"name":"probe","version":"1.0.0"}' > package.json
+    if npm install safe-chain-test >/dev/null 2>&1 && [ -d node_modules/safe-chain-test ]; then
+      echo "  FAIL: known-malicious fixture INSTALLED -- screening is not active" >&2
+      exit 1
+    fi ) || FAILED=1
+  [ "$FAILED" = "1" ] || ok "known-malicious npm fixture refused"
+  rm -rf "$d"
+  # Deliberately npm-only. Safe Chain screens Python through its proxy, which
+  # sbe's reserved HTTPS_PROXY makes unreachable inside the cage, so there is
+  # no Python screening here to assert. Checking it would fail honestly but
+  # noisily every start; claiming it passes would be worse.
+fi
+
+if [ "$FAILED" = "1" ]; then
+  echo "======================================================================" >&2
+  echo "SUPPLY CHAIN HEALTH CHECK FAILED" >&2
+  echo "Installs may run WITHOUT screening, WITHOUT the sandbox, or both." >&2
+  echo "Do not install dependencies until this passes." >&2
+  echo "======================================================================" >&2
+  exit 1
+fi
+echo "[supply-chain] all layers enforcing."
+CHECK
+chmod 0755 /opt/supply-chain-healthcheck.sh
+HEALTHCHECK_SETUP
+
+# supply-chain-hardening: hardened defaults for every package manager present.
+#
+# This is the layer the other two do not cover. sbe contains what an install
+# can do and Safe Chain judges whether a package is known-bad; this decides how
+# the package managers behave in the first place -- age gates, script blocking,
+# locked resolution, signature checks -- across npm, pnpm, yarn, pip, uv, bun,
+# maven, gradle, nuget and more.
+#
+# The CI-shaped harden.sh is used rather than the Ansible role deliberately: it
+# is the subset without the PAM layer, podman, or interactive npq. npq would be
+# redundant here anyway, since Safe Chain's PATH shims screen interactive and
+# non-interactive shells alike.
+#
+# Pinned to a commit, not a tag: the action postdates v1.2.1 and there is no
+# release containing it yet.
+# renovate: datasource=github-tags depName=echennells/supply-chain-hardening
+ARG SCH_COMMIT=22be713
+ARG SCH_HARDEN_SHA256=f595c82497721ead72c5fb8bd6b60b024d9b2ef08d96c0adff5290918d5b85d2
+USER root
+RUN curl -fsSL "https://raw.githubusercontent.com/echennells/supply-chain-hardening/${SCH_COMMIT}/action/harden.sh" \
+      -o /tmp/harden.sh && \
+    echo "${SCH_HARDEN_SHA256}  /tmp/harden.sh" | sha256sum -c - && \
+    install -m 0755 /tmp/harden.sh /opt/supply-chain-harden.sh && \
+    rm /tmp/harden.sh
+
+# Write the config-file layer (~/.npmrc, uv.toml, bunfig.toml, cargo, ...) at
+# build time. Config files are shell-independent, which is what makes them the
+# primary control: they apply to `bash -c` from an agent exactly as they do to
+# a human's login shell.
+USER vscode
+RUN bash /opt/supply-chain-harden.sh --emit=plain || \
+    echo "[build] harden.sh reported degraded ecosystems; see the table above"
+
+# The env layer, promoted from /etc/profile.d to image ENV.
+#
+# harden.sh calls env a "redundant second layer behind (1)", and routes it
+# through a platform adapter because CI needs step-to-step propagation. A
+# container has a better mechanism than either: ENV reaches every process
+# regardless of shell, so agent tool calls through `bash -c` -- which never
+# source /etc/profile.d -- get the env layer too.
+#
+# NPM_CONFIG_MIN_RELEASE_AGE is the one value that conflicted with upstream's
+# containerEnv (upstream 1 day, this 2). npm resolves env above .npmrc, so
+# leaving upstream's in place would silently halve the gate. Upstream's copies
+# of these keys are dropped from devcontainer.json; this is the single source
+# of truth, derived from release_age_hours=48.
+ENV NPM_CONFIG_IGNORE_SCRIPTS=true \
+    NPM_CONFIG_AUDIT=true \
+    NPM_CONFIG_SAVE_EXACT=true \
+    NPM_CONFIG_FUND=false \
+    NPM_CONFIG_UPDATE_NOTIFIER=false \
+    NPM_CONFIG_MIN_RELEASE_AGE=2 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    UV_LINK_MODE=copy \
+    COMPOSER_ALLOW_SUPERUSER=1 \
+    GOSUMDB=sum.golang.org \
+    GOPROXY=https://proxy.golang.org,direct \
+    GOFLAGS=-mod=readonly \
+    GOTOOLCHAIN=local \
+    GRADLE_USER_HOME=/home/vscode/.gradle \
+    DOTNET_NUGET_SIGNATURE_VERIFICATION=true
 
 # Copy post_install script
 COPY --chown=vscode:vscode post_install.py /opt/post_install.py

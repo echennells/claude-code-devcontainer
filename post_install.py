@@ -134,11 +134,15 @@ def setup_claude_settings():
     # Bare names are untouched and remain the supported way to call these.
     home = Path.home()
     managers = [
-        "npm", "pnpm", "yarn", "bun", "npx",
+        # node
+        "npm", "npx", "pnpm", "pnpx", "yarn", "bun", "bunx", "rush", "rushx",
+        # rust
         "cargo", "rustc",
-        "pip", "pip3", "uv", "uvx", "poetry",
-        "mvn", "gradle", "sbt", "mix",
+        # python
+        "pip", "pip3", "uv", "uvx", "poetry", "pipx", "pdm",
         "python", "python3",
+        # jvm / beam
+        "mvn", "gradle", "sbt", "mix",
     ]
     deny = settings["permissions"].setdefault("deny", [])
     desired_denies = [f"Bash(/usr/bin/{m}:*)" for m in managers]

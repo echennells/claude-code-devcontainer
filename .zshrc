@@ -9,19 +9,34 @@ export FNM_DIR="$HOME/.fnm"
 export PATH="$FNM_DIR:$PATH"
 eval "$(fnm env --use-on-cd)"
 
-# Pin sbe-shims to the front of PATH so package-manager invocations route
-# through the sandbox. fnm prepends its multishell dir to PATH at shell start
-# and on `cd` into projects with .nvmrc, which would otherwise shadow our
-# shims for npm/pnpm/yarn/bun/npx. Strip any existing occurrences first to
-# avoid duplicates accumulating across `cd`s.
-_sbe_pin_shims() {
-  local p="${PATH//\/usr\/local\/bin\/sbe-shims:/}"
-  p="${p%:/usr/local/bin/sbe-shims}"
-  export PATH="/usr/local/bin/sbe-shims:$p"
+# One hook owns the whole shim order. Neither vendor pin survives on its own:
+# two functions each racing their own dir to the front means whichever runs
+# last wins, and the loser's layer is silently skipped.
+#
+# Order is Safe Chain -> sbe -> real binary, and it is deliberate. Safe Chain
+# must sit OUTSIDE the cage: it needs to reach intel.aikido.dev, which is not
+# on any sbe profile's allowlist (a CONNECT there returns 403), and sbe will
+# not exec its binary anyway since it is not in allowExec. Outside the cage it
+# screens first, then hands the install to the sbe shim, which cages it.
+#
+# Both vendor shims resolve their target by stripping only their own directory
+# from PATH and re-running `command -v`, so they chain without knowing about
+# each other.
+#
+# Runs on precmd as well as chpwd: `cd` alone leaves a window open after any
+# PATH-prepending event that is not a directory change -- venv activate,
+# direnv, conda, nvm use -- during which the shims are shadowed.
+_pin_supply_chain_shims() {
+  local sc="$HOME/.safe-chain/shims" sb="/usr/local/bin/sbe-shims"
+  local p="$PATH"
+  p="${p//$sc:/}"; p="${p%:$sc}"
+  p="${p//$sb:/}"; p="${p%:$sb}"
+  export PATH="$sc:$sb:$p"
 }
-_sbe_pin_shims
+_pin_supply_chain_shims
 autoload -U add-zsh-hook
-add-zsh-hook chpwd _sbe_pin_shims
+add-zsh-hook chpwd  _pin_supply_chain_shims
+add-zsh-hook precmd _pin_supply_chain_shims
 
 # History settings
 export HISTFILE=/commandhistory/.zsh_history

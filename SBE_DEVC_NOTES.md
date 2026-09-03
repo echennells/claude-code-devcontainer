@@ -806,3 +806,60 @@ Only `npm`, `npx` and `uv` have real binaries behind their shims in this
 image; the other twelve are inert until those tools are installed. An inert
 shim exits 127 with a clear message rather than falling through, so it fails
 closed.
+
+---
+
+## 15. The four-layer merge (2026-09-02)
+
+`feat/merged-supply-chain` combines the upstream devcontainer,
+`supply-chain-hardening`, Aikido Safe Chain, and sbe. Each answers a different
+question: what is in the box, how package managers behave, whether a package is
+known-bad, and what an install can reach if it is bad-but-unknown.
+
+### Ordering
+
+Safe Chain outermost, then sbe, then the real binary. Inverting that does not
+work: sbe refuses to exec Safe Chain's binary (not in `allowExec`), and a
+CONNECT to `intel.aikido.dev` through sbe's proxy returns 403. Outside the cage
+Safe Chain screens first and hands the install to the sbe shim.
+
+Both vendor shims resolve their target by stripping only their own directory
+from PATH and re-running `command -v`, so they chain without knowing about each
+other. One `_pin_supply_chain_shims` hook owns the order on `chpwd` and
+`precmd`; both vendor hooks are removed rather than outvoted.
+
+### The config conflict
+
+`NPM_CONFIG_MIN_RELEASE_AGE` was upstream 1 day vs the role's 2. npm resolves
+env above `.npmrc`, so upstream's `containerEnv` silently halved the gate.
+Upstream's nine overlapping keys are dropped; the role's env layer is promoted
+from `/etc/profile.d` to image `ENV`, which reaches `bash -c` — how agents
+invoke commands, and something profile.d never covers.
+
+### The CA bundle
+
+Safe Chain MITMs downloads and writes its CA under `/tmp`. sbe gives sandboxed
+processes a private temp root, so the caged child could not read it and every
+`uv` install failed with `invalid peer certificate: UnknownIssuer`. Setting
+`SSL_CERT_FILE` at build time does not help — Safe Chain overwrites it and says
+so. The shim now passes `--allow-read` for exactly the paths those variables
+name.
+
+### What the merge does not achieve
+
+sbe reserves `HTTPS_PROXY` and refuses `--keep-env` for it, so a caged child
+always talks to sbe's proxy and never Safe Chain's. Therefore:
+
+| Ecosystem | Isolation | Defaults | Screening | Cage |
+|---|---|---|---|---|
+| npm | yes | yes | yes (pre-scan, outside cage) | yes |
+| python | yes | yes | **no** (proxy unreachable inside cage) | yes |
+
+npm screening survives because Safe Chain scans before invoking anything.
+Python screening is proxy-only and is lost. Python keeps the cage and the age
+gate. Closing this needs upstream support for chaining sbe's proxy to an outer
+one; there is no configuration that achieves it today.
+
+The health check asserts npm screening and does not claim Python screening.
+That distinction is the point: an earlier merged build passed a presence-based
+check while Safe Chain's proxy was dead and every Python install was broken.
