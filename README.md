@@ -345,9 +345,29 @@ local CA under `~/.safe-chain/certs/`. The private key lives in the container an
 exactly as trustworthy as the container is.
 
 This is screening, not sandboxing: it catches packages Aikido already knows about and
-does nothing about a package that is merely new. `NPM_CONFIG_IGNORE_SCRIPTS=true` and
-`NPM_CONFIG_MIN_RELEASE_AGE` are set in `devcontainer.json` to blunt the two most
-common gaps.
+does nothing about a package that is merely new. The package-manager defaults from
+`supply-chain-hardening` (`ignore-scripts`, a 48h `min-release-age`) blunt the two
+most common gaps.
+
+### PyPI is not screened in this image
+
+Safe Chain screens npm with a pre-install scan, and screens pip/uv by MITM-ing the
+download through its own proxy. sbe reserves `HTTPS_PROXY` for its own authenticated
+proxy and refuses `--keep-env` for it, so a caged process never reaches Safe Chain's
+proxy. The npm scan survives because it runs outside the cage; the Python screening
+does not.
+
+| | isolation | defaults | Aikido screening | sbe cage |
+|---|---|---|---|---|
+| npm / node | yes | yes | **yes** | yes |
+| pip / uv / poetry | yes | yes | **no** | yes |
+| python / python3 | yes | yes | yes | **no** (would cage every script run) |
+| cargo, mvn, gradle, mix | yes | yes | n/a (not covered by Aikido) | yes |
+
+Python keeps hardened defaults and the sandbox; it does not get the intel feed.
+Closing this needs upstream support for chaining sbe's proxy to an outer one. The
+startup health check prints this table on every container start rather than leaving
+the gap implied.
 
 ## Threat Model
 
@@ -356,7 +376,7 @@ common gaps.
 - Direct access to your SSH key material and other credentials
 - Unrestricted, direct access to the whole filesystem
 - Cross-engagement leakage
-- Installing npm/PyPI packages Aikido Intel already flags as malicious
+- Installing **npm** packages Aikido Intel already flags as malicious
 
 **Does not protect against:**
 

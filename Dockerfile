@@ -155,9 +155,9 @@ fi
 # Map tool -> sbe ecosystem profile. sbe v0.3.2 supports: node, rust, python,
 # elixir, java. Explicit --profile avoids auto-detect failures.
 case "$tool" in
-  npm|pnpm|yarn|bun|npx)         prof=node ;;
+  npm|pnpm|yarn|bun|npx|pnpx|bunx|rush|rushx) prof=node ;;
   cargo|rustc)                   prof=rust ;;
-  pip|pip3|uv|poetry)            prof=python ;;
+  pip|pip3|uv|uvx|poetry|pipx|pdm) prof=python ;;
   mvn|gradle|sbt)                prof=java ;;
   mix)                           prof=elixir ;;
   *)                             prof= ;;
@@ -208,7 +208,19 @@ exec env -u CLAUDE_CODE_OAUTH_TOKEN -u ANTHROPIC_API_KEY \
   sbe run $profile_arg $ca_args -- "$real" "$@"
 SHIM
 chmod 0755 /usr/local/bin/sbe-shims/_sbe-shim
-for t in npm pnpm yarn bun npx cargo rustc pip pip3 uv poetry mvn gradle sbt mix; do
+# Must track Safe Chain's shim set. Where the two disagree the stack goes
+# split-brain: a tool Safe Chain wraps but sbe does not is screened and
+# uncaged, and vice versa. Measured before this list was widened, Safe Chain
+# alone covered bunx, pdm, pipx, pnpx, rush, rushx and uvx.
+#
+# python/python3 are deliberately NOT here. Safe Chain shims them because it
+# only acts on install-shaped invocations; an sbe shim would cage every python
+# process in the container, including ordinary script runs. They stay screened
+# and uncaged, and the deny-list still blocks the absolute-path routes to them.
+for t in npm pnpm yarn bun npx pnpx bunx rush rushx \
+         cargo rustc \
+         pip pip3 uv uvx poetry pipx pdm \
+         mvn gradle sbt mix; do
   ln -sf _sbe-shim /usr/local/bin/sbe-shims/$t
 done
 SHIM_SETUP
@@ -306,37 +318,6 @@ RUN curl -fsSL "https://github.com/AikidoSec/safe-chain/releases/download/${SAFE
   sh /tmp/install-safe-chain.sh --ci && \
   rm /tmp/install-safe-chain.sh
 
-# Safe Chain's CA into the system trust store.
-#
-# Safe Chain screens Python by MITM-ing the download through a local proxy, so
-# the client must trust its CA. It drops a bundle in /tmp and points the child
-# at it -- but the child runs inside the sbe cage, which gives sandboxed
-# processes a private temp root, so that path is unreadable and the handshake
-# fails with "invalid peer certificate: UnknownIssuer". Every uv install breaks.
-#
-# /etc/ssl/certs IS readable inside the cage, so install the CA there instead
-# and point the TLS clients at the system bundle.
-#
-# The tradeoff is explicit: a MITM CA in the system store means whoever holds
-# ~/.safe-chain/certs/ca-key.pem can mint a trusted cert for any host in this
-# container. That is the trust Safe Chain already asks for by design -- this
-# only makes it durable and readable from inside the sandbox. The key stays
-# denied to sandboxed children, which is what keeps a caged install from
-# minting its own.
-USER root
-RUN cp /home/vscode/.safe-chain/certs/ca-cert.pem \
-       /usr/local/share/ca-certificates/safe-chain.crt && \
-    update-ca-certificates >/dev/null 2>&1 && \
-    echo "[build] safe-chain CA installed into system trust store"
-USER vscode
-
-# Point TLS clients at the system bundle rather than Safe Chain's /tmp copy.
-# UV_NATIVE_TLS makes uv use the OS trust store instead of its vendored roots.
-ENV UV_NATIVE_TLS=1 \
-    SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
-    REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt \
-    NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt
-
 # Baseline shim order for EVERY process, login shell or not. The .zshrc hook
 # only repairs what fnm disturbs in interactive zsh; this is what makes the
 # chain hold for `bash -c` and `sh -c`, which is how Claude Code and opencode
@@ -422,6 +403,17 @@ if [ "${SUPPLY_CHAIN_DEEP_CHECK:-0}" = "1" ]; then
   # no Python screening here to assert. Checking it would fail honestly but
   # noisily every start; claiming it passes would be worse.
 fi
+
+# Say plainly what is and is not covered. The Python gap is structural -- sbe
+# reserves HTTPS_PROXY, so Safe Chain's proxy-only Python screening cannot
+# reach a caged process -- and an operator who is not told will assume npm's
+# coverage extends to pip. Printed every start, because a limitation nobody
+# reads is the same as one nobody fixed.
+echo "[supply-chain] coverage:"
+echo "    npm/node    defaults + Aikido screening + sbe cage"
+echo "    python      defaults + sbe cage; NO Aikido screening"
+echo "                (proxy-only screening cannot cross the cage boundary)"
+echo "    python3/python invocations are screened but NOT caged by design"
 
 if [ "$FAILED" = "1" ]; then
   echo "======================================================================" >&2

@@ -863,3 +863,42 @@ one; there is no configuration that achieves it today.
 The health check asserts npm screening and does not claim Python screening.
 That distinction is the point: an earlier merged build passed a presence-based
 check while Safe Chain's proxy was dead and every Python install was broken.
+
+### 15.1 Corrections after review (2026-09-04)
+
+Four claims in section 15 and its commit message were wrong or incomplete.
+
+**The wrapper layer was never skipped.** Section 15 said applying the role
+config-only took the chain "from four PATH layers to two". It did not.
+`harden.sh` wraps tools *in place at their discovered path*, and the paths it
+discovered were the shim directories themselves: `~/.safe-chain/shims/bun` is
+now a harden wrapper pointing at `bun-real` (the original Safe Chain shim), and
+`/usr/local/bin/sbe-shims/cargo` wraps `cargo-real` (a symlink to `_sbe-shim`).
+So `bun` really is four deep. This is benign -- each wrapper refuses to recurse
+and the chain still terminates -- but the claim was false.
+
+**The shim sets did not match.** Measured on the first merged build, Safe Chain
+wrapped `bunx`, `pdm`, `pipx`, `pnpx`, `python`, `python3`, `rush`, `rushx` and
+`uvx` while sbe did not, so those nine were screened and uncaged. The sbe set
+now tracks Safe Chain's except for `python`/`python3`, which stay uncaged
+deliberately: an sbe shim there would cage every python process, not just
+installs. Remaining asymmetry is `cargo`, `rustc`, `mvn`, `gradle`, `sbt` and
+`mix` -- caged, and outside Aikido's coverage anyway.
+
+**The CA trust widening was unnecessary.** Section 15 installed Safe Chain's
+MITM CA into the system trust store and set `SSL_CERT_FILE` image-wide. That
+made every TLS client in the container trust a CA whose private key sits at
+`~/.safe-chain/certs/ca-key.pem`, readable by any uncaged process -- a real
+widening of trust beyond what the Safe Chain-only branch did, where only
+children inheriting the /tmp bundle trusted it. It was also not needed: with
+the shim granting `--allow-read` on the paths Safe Chain names, `uv` installs
+succeed with the CA nowhere in the system store. Both the trust-store install
+and the TLS env block are removed; verified 20/20 without them.
+
+**The documentation claimed screening it did not have.** The README threat
+model listed "Installing npm/PyPI packages Aikido Intel already flags as
+malicious", and `CLAUDE.md` still described an sbe-only container with no
+mention of the outer Safe Chain layer. Both are corrected, and the startup
+health check now prints the coverage table on every container start rather than
+leaving the Python gap implied -- the health check deliberately does not assert
+Python screening, so nothing else would have surfaced it.
